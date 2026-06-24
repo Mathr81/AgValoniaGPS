@@ -196,6 +196,7 @@ jobs:
             -r ios-arm64 \
             /p:CodesignKey="${{ env.CI_CERT_NAME }}" \
             /p:CodesignProvision="$PROVISION" \
+            /p:ApplicationId=com.mathr81.DummyApp \
             /p:BuildIpa=false
 
       # Payload trick : identique au workflow Movix de référence
