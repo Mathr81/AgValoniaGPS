@@ -55,7 +55,7 @@ jobs:
   build-ios:
     name: 🍎 iOS IPA (sideload)
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 120
     if: ${{ inputs.build_ios }}
 
     steps:
@@ -197,7 +197,9 @@ jobs:
             /p:CodesignKey="${{ env.CI_CERT_NAME }}" \
             /p:CodesignProvision="$PROVISION" \
             /p:ApplicationId=com.mathr81.DummyApp \
-            /p:BuildIpa=false
+            /p:BuildIpa=false \
+            /p:EnableAssemblyILStripping=false \
+            /p:MtouchInterpreter=all
 
       # Payload trick : identique au workflow Movix de référence
       - name: Package → .ipa
