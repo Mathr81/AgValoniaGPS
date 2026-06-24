@@ -79,9 +79,21 @@ jobs:
             sleep 10
           done
 
+      # Détecte quel mode de signature utiliser (secrets non accessibles dans if:)
+      - name: Detect signing mode
+        id: signing
+        env:
+          HAS_P12: ${{ secrets.IOS_P12_BASE64 }}
+        run: |
+          if [ -n "$HAS_P12" ]; then
+            echo "mode=B" >> $GITHUB_OUTPUT
+          else
+            echo "mode=A" >> $GITHUB_OUTPUT
+          fi
+
       # ── Signing : Mode A (certificat OpenSSL généré en CI) ────────────────
       - name: Setup signing — Mode A (fake cert, aucun secret requis)
-        if: ${{ secrets.IOS_P12_BASE64 == '' }}
+        if: steps.signing.outputs.mode == 'A'
         run: |
           KEYCHAIN_PASS=$(uuidgen)
           echo "CI_KEYCHAIN_PASS=$KEYCHAIN_PASS" >> $GITHUB_ENV
@@ -132,7 +144,7 @@ jobs:
 
       # ── Signing : Mode B (vrais secrets GitHub) ───────────────────────────
       - name: Setup signing — Mode B (secrets IOS_P12_BASE64)
-        if: ${{ secrets.IOS_P12_BASE64 != '' }}
+        if: steps.signing.outputs.mode == 'B'
         env:
           P12_B64:      ${{ secrets.IOS_P12_BASE64 }}
           P12_PASS:     ${{ secrets.IOS_P12_PASSWORD }}
