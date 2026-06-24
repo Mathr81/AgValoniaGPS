@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       build_desktop:
-        description: '🖥️ Desktop — Windows + macOS + Linux (tous les targets)'
+        description: '🖥️ Desktop — Windows + macOS + Linux'
         type: boolean
         default: false
 
@@ -21,16 +21,37 @@ env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
-# ─────────────────────────────────────────────────────────────────────────────
-# iOS — IPA non signée pour sideload (SideStore / AltStore / Sideloadly)
-#
-# Le build cible ios-arm64 (device réel, pas le simulateur).
-# La signature est désactivée via les env vars CODE_SIGN_* que dotnet
-# transmet en interne à xcodebuild, + les props MSBuild CodesignKey/Provision.
-# SideStore re-signe l'IPA avec ton Apple ID au moment de l'installation.
-# Durée de validité : 7 jours (Apple ID gratuit) — SideStore renouvelle auto.
-# ─────────────────────────────────────────────────────────────────────────────
 jobs:
+
+  # ── iOS ────────────────────────────────────────────────────────────────────
+  #
+  # SIGNATURE : deux modes selon les secrets configurés.
+  #
+  # MODE A — Zéro setup (aucun secret) :
+  #   Un certificat auto-signé "Apple Development: CI Build" est généré
+  #   à la volée avec OpenSSL. Xamarin.Shared.targets cherche uniquement
+  #   ce pattern CN dans le keychain, sans vérifier la chaîne Apple.
+  #   codesign accepte n'importe quel cert valide pour code signing.
+  #   SideStore re-signe de toute façon à l'installation → ça marche.
+  #
+  # MODE B — Si le Mode A échoue sur le provisioning profile :
+  #   Stocker dans GitHub Secrets (Settings → Secrets → Actions) :
+  #     IOS_P12_BASE64   → base64 d'un .p12 exporté depuis ta VM macOS
+  #     IOS_P12_PASSWORD → mot de passe du .p12
+  #     IOS_PROFILE_B64  → base64 d'un .mobileprovision (Xcode Personal Team)
+  #
+  #   Procédure sur la VM macOS (une seule fois, ~15 min) :
+  #     1. Xcode → Settings → Accounts → ton Apple ID gratuit
+  #        → Manage Certificates → + → Apple Development
+  #     2. Keychain Access → "Apple Development: ton@email.com"
+  #        → Export → certificate.p12 (note le mot de passe)
+  #        base64 -i certificate.p12 | pbcopy   → IOS_P12_BASE64
+  #     3. Crée un projet iOS vide dans Xcode, signe avec Personal Team.
+  #        Xcode génère un .mobileprovision dans :
+  #        ~/Library/MobileDevice/Provisioning Profiles/*.mobileprovision
+  #        base64 -i ~/Library/MobileDevice/"Provisioning Profiles"/XXXX.mobileprovision | pbcopy
+  #        → IOS_PROFILE_B64
+  # ──────────────────────────────────────────────────────────────────────────
   build-ios:
     name: 🍎 iOS IPA (sideload)
     runs-on: macos-26
@@ -40,9 +61,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Xcode 26.4.1 est le seul dont la platform iOS est complètement installée
-      # sur macos-26 (26.5 beta est présent mais "iOS 26.5 Platform Not Installed").
-      # Rollback forward quand Apple shippe Xcode 26.5 GA.
       - name: Select Xcode 26.4.1
         run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
 
@@ -61,47 +79,133 @@ jobs:
             sleep 10
           done
 
+      # ── Signing : Mode A (certificat OpenSSL généré en CI) ────────────────
+      - name: Setup signing — Mode A (fake cert, aucun secret requis)
+        if: ${{ secrets.IOS_P12_BASE64 == '' }}
+        run: |
+          KEYCHAIN_PASS=$(uuidgen)
+          echo "CI_KEYCHAIN_PASS=$KEYCHAIN_PASS" >> $GITHUB_ENV
+
+          security create-keychain -p "$KEYCHAIN_PASS" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain  -p "$KEYCHAIN_PASS" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+
+          # CN au format exact attendu par Xamarin.Shared.targets
+          cat > /tmp/cert.cnf << 'EOF'
+          [ req ]
+          default_bits       = 2048
+          distinguished_name = dn
+          x509_extensions    = ext
+          prompt             = no
+          [ dn ]
+          CN = Apple Development: CI Build (AABBCCDDEE)
+          OU = AABBCCDDEE
+          O  = Personal Team
+          C  = US
+          [ ext ]
+          basicConstraints = critical, CA:false
+          keyUsage         = critical, digitalSignature
+          extendedKeyUsage = critical, codeSigning
+          EOF
+
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tmp/ci_key.pem -out /tmp/ci_cert.pem \
+            -days 1 -config /tmp/cert.cnf
+
+          openssl pkcs12 -export -legacy \
+            -inkey /tmp/ci_key.pem -in /tmp/ci_cert.pem \
+            -out /tmp/ci_cert.p12 -passout pass:ci_temp
+
+          security import /tmp/ci_cert.p12 -k build.keychain \
+            -P ci_temp -T /usr/bin/codesign -A
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" build.keychain
+
+          rm -f /tmp/ci_key.pem /tmp/ci_cert.pem /tmp/ci_cert.p12 /tmp/cert.cnf
+
+          CERT=$(security find-identity -v -p codesigning build.keychain \
+            | grep "Apple Development" | head -1 | awk -F'"' '{print $2}')
+          echo "CI_CERT_NAME=$CERT" >> $GITHUB_ENV
+          echo "CI_PROFILE_UUID="  >> $GITHUB_ENV   # vide = pas de profil
+          echo "✅ [Mode A] Identité créée : $CERT"
+
+      # ── Signing : Mode B (vrais secrets GitHub) ───────────────────────────
+      - name: Setup signing — Mode B (secrets IOS_P12_BASE64)
+        if: ${{ secrets.IOS_P12_BASE64 != '' }}
+        env:
+          P12_B64:      ${{ secrets.IOS_P12_BASE64 }}
+          P12_PASS:     ${{ secrets.IOS_P12_PASSWORD }}
+          PROFILE_B64:  ${{ secrets.IOS_PROFILE_B64 }}
+        run: |
+          KEYCHAIN_PASS=$(uuidgen)
+          echo "CI_KEYCHAIN_PASS=$KEYCHAIN_PASS" >> $GITHUB_ENV
+
+          security create-keychain -p "$KEYCHAIN_PASS" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain  -p "$KEYCHAIN_PASS" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+
+          echo "$P12_B64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k build.keychain \
+            -P "$P12_PASS" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" build.keychain
+          rm /tmp/cert.p12
+
+          CERT=$(security find-identity -v -p codesigning build.keychain \
+            | grep -oE '"[^"]+"' | head -1 | tr -d '"')
+          echo "CI_CERT_NAME=$CERT" >> $GITHUB_ENV
+
+          if [ -n "$PROFILE_B64" ]; then
+            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            echo "$PROFILE_B64" | base64 --decode > /tmp/profile.mobileprovision
+            UUID=$(security cms -D -i /tmp/profile.mobileprovision \
+              | plutil -extract UUID raw -)
+            cp /tmp/profile.mobileprovision \
+              ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision
+            rm /tmp/profile.mobileprovision
+            echo "CI_PROFILE_UUID=$UUID" >> $GITHUB_ENV
+            echo "✅ [Mode B] Cert: $CERT | Profile: $UUID"
+          else
+            echo "CI_PROFILE_UUID=" >> $GITHUB_ENV
+            echo "✅ [Mode B] Cert: $CERT (pas de profile)"
+          fi
+
       - name: Restore dependencies
         run: dotnet restore Platforms/AgValoniaGPS.iOS/AgValoniaGPS.iOS.csproj
 
-      # Les env vars sont héritées par le xcodebuild appelé en interne par dotnet.
-      # /p:BuildIpa=false évite que dotnet tente de créer une IPA signée lui-même.
-      - name: Build iOS — device, non signé
-        env:
-          CODE_SIGN_IDENTITY: ""
-          CODE_SIGNING_REQUIRED: "NO"
-          CODE_SIGNING_ALLOWED: "NO"
+      - name: Build iOS (device, ios-arm64)
         run: |
+          PROVISION="${{ env.CI_PROFILE_UUID }}"
           dotnet build Platforms/AgValoniaGPS.iOS/AgValoniaGPS.iOS.csproj \
             -c Release \
             -f net10.0-ios \
             -r ios-arm64 \
-            /p:CodesignKey="" \
-            /p:CodesignProvision="" \
+            /p:CodesignKey="${{ env.CI_CERT_NAME }}" \
+            /p:CodesignProvision="$PROVISION" \
             /p:BuildIpa=false
 
-      # Pattern identique au workflow Movix : mkdir Payload → cp .app → zip → .ipa
+      # Payload trick : identique au workflow Movix de référence
       - name: Package → .ipa
         run: |
-          # Chemin attendu en Release ios-arm64
           APP=$(find Platforms/AgValoniaGPS.iOS/bin/Release/net10.0-ios/ios-arm64 \
                   -maxdepth 3 -name "*.app" -type d 2>/dev/null | head -1)
-          # Fallback : recherche large si le layout change
           [ -z "$APP" ] && \
             APP=$(find Platforms/AgValoniaGPS.iOS/bin -name "*.app" -type d | head -1)
 
           if [ -z "$APP" ]; then
-            echo "❌ Aucun .app bundle trouvé. Listing du répertoire bin :"
+            echo "❌ Aucun .app trouvé. Listing :"
             find Platforms/AgValoniaGPS.iOS/bin -maxdepth 6 | head -50
             exit 1
           fi
 
-          echo "✅ .app trouvé : $APP"
+          echo "✅ .app : $APP"
           mkdir Payload
           cp -r "$APP" Payload/
           zip -r AgValoniaGPS.ipa Payload/
           rm -rf Payload
-          echo "📦 IPA prête — taille : $(du -sh AgValoniaGPS.ipa | cut -f1)"
+          echo "📦 IPA — $(du -sh AgValoniaGPS.ipa | cut -f1)"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
@@ -111,9 +215,11 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # Android — APK signé (ou debug key si pas de secret configuré)
-  # ───────────────────────────────────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain build.keychain || true
+
+  # ── Android ────────────────────────────────────────────────────────────────
   build-android:
     name: 🤖 Android APK
     runs-on: ubuntu-latest
@@ -142,23 +248,22 @@ jobs:
             sleep 10
           done
 
-      - name: Restore dependencies
+      - name: Restore
         run: dotnet restore Platforms/AgValoniaGPS.Android/AgValoniaGPS.Android.csproj
 
-      - name: Decode keystore de signing
+      - name: Decode keystore
         id: keystore
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/agvalonia-release.keystore"
-            echo "path=$RUNNER_TEMP/agvalonia-release.keystore" >> "$GITHUB_OUTPUT"
-            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "path=$RUNNER_TEMP/release.keystore" >> "$GITHUB_OUTPUT"
+            echo "present=true"  >> "$GITHUB_OUTPUT"
             echo "✅ Keystore release chargé."
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Secret ANDROID_KEYSTORE_BASE64 absent — fallback sur la debug key éphémère."
-            echo "    L'APK résultant ne pourra pas mettre à jour une installation signée avec une autre clé."
+            echo "⚠️  Pas de secret keystore → debug key éphémère."
           fi
 
       - name: Build APK
@@ -180,9 +285,8 @@ jobs:
         run: |
           APK=$(find publish/android -name "*-Signed.apk" | head -1)
           [ -z "$APK" ] && APK=$(find publish/android -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then echo "❌ Aucun APK trouvé."; exit 1; fi
+          if [ -z "$APK" ]; then echo "❌ Aucun APK."; exit 1; fi
           cp "$APK" AgValoniaGPS-Android.apk
-          echo "✅ APK : $(du -sh AgValoniaGPS-Android.apk | cut -f1)"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -192,9 +296,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # Desktop — Windows / macOS / Linux (self-contained, pas de .NET requis)
-  # ───────────────────────────────────────────────────────────────────────────
+  # ── Desktop ────────────────────────────────────────────────────────────────
   build-desktop:
     name: 🖥️ ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -231,7 +333,6 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      # macOS multi-target : DesktopOnly=true pour éviter la résolution iOS
       - name: Restore (macOS)
         if: runner.os == 'macOS'
         run: |
