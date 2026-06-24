@@ -1,185 +1,124 @@
-name: Build and Release
+name: Build Applications
 
 on:
-  push:
-    branches: [master, develop]
-  pull_request:
-    branches: [develop]
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: 'Release tag (e.g. v26.2.0). Leave empty for nightly build.'
-        required: false
-        default: ''
-  schedule:
-    # Run daily at 6 AM UTC (if there were changes)
-    - cron: '0 6 * * *'
-
-# Cancel in-progress runs for the same branch
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-# Permissions needed for creating releases
-permissions:
-  contents: write
+      build_ios:
+        description: '🍎 iOS — IPA sideloadable (SideStore / AltStore)'
+        type: boolean
+        default: true
+      build_android:
+        description: '🤖 Android — APK'
+        type: boolean
+        default: false
+      build_desktop:
+        description: '🖥️ Desktop — Windows + macOS + Linux (tous les targets)'
+        type: boolean
+        default: false
 
 env:
   DOTNET_VERSION: '10.0.x'
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
+# ─────────────────────────────────────────────────────────────────────────────
+# iOS — IPA non signée pour sideload (SideStore / AltStore / Sideloadly)
+#
+# Le build cible ios-arm64 (device réel, pas le simulateur).
+# La signature est désactivée via les env vars CODE_SIGN_* que dotnet
+# transmet en interne à xcodebuild, + les props MSBuild CodesignKey/Provision.
+# SideStore re-signe l'IPA avec ton Apple ID au moment de l'installation.
+# Durée de validité : 7 jours (Apple ID gratuit) — SideStore renouvelle auto.
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
-  # Check if there are new commits (for scheduled runs)
-  check-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
+  build-ios:
+    name: 🍎 iOS IPA (sideload)
+    runs-on: macos-26
+    timeout-minutes: 60
+    if: ${{ inputs.build_ios }}
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
-      - name: Check for changes
-        id: check
+      # Xcode 26.4.1 est le seul dont la platform iOS est complètement installée
+      # sur macos-26 (26.5 beta est présent mais "iOS 26.5 Platform Not Installed").
+      # Rollback forward quand Apple shippe Xcode 26.5 GA.
+      - name: Select Xcode 26.4.1
+        run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install iOS workload (pinné 26.4.x)
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # For scheduled runs, check if there were commits in the last 24 hours
-            COMMITS=$(git log --since="24 hours ago" --oneline | wc -l)
-            if [ "$COMMITS" -gt 0 ]; then
-              echo "should_build=true" >> $GITHUB_OUTPUT
-              echo "Found $COMMITS commits in last 24 hours, will build"
-            else
-              echo "should_build=false" >> $GITHUB_OUTPUT
-              echo "No commits in last 24 hours, skipping build"
-            fi
-          else
-            # For push and manual triggers, always build
-            echo "should_build=true" >> $GITHUB_OUTPUT
+          for i in 1 2 3; do
+            dotnet workload install ios \
+              --from-rollback-file .github/workflows/dotnet-ios-rollback.json \
+              && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Restore dependencies
+        run: dotnet restore Platforms/AgValoniaGPS.iOS/AgValoniaGPS.iOS.csproj
+
+      # Les env vars sont héritées par le xcodebuild appelé en interne par dotnet.
+      # /p:BuildIpa=false évite que dotnet tente de créer une IPA signée lui-même.
+      - name: Build iOS — device, non signé
+        env:
+          CODE_SIGN_IDENTITY: ""
+          CODE_SIGNING_REQUIRED: "NO"
+          CODE_SIGNING_ALLOWED: "NO"
+        run: |
+          dotnet build Platforms/AgValoniaGPS.iOS/AgValoniaGPS.iOS.csproj \
+            -c Release \
+            -f net10.0-ios \
+            -r ios-arm64 \
+            /p:CodesignKey="" \
+            /p:CodesignProvision="" \
+            /p:BuildIpa=false
+
+      # Pattern identique au workflow Movix : mkdir Payload → cp .app → zip → .ipa
+      - name: Package → .ipa
+        run: |
+          # Chemin attendu en Release ios-arm64
+          APP=$(find Platforms/AgValoniaGPS.iOS/bin/Release/net10.0-ios/ios-arm64 \
+                  -maxdepth 3 -name "*.app" -type d 2>/dev/null | head -1)
+          # Fallback : recherche large si le layout change
+          [ -z "$APP" ] && \
+            APP=$(find Platforms/AgValoniaGPS.iOS/bin -name "*.app" -type d | head -1)
+
+          if [ -z "$APP" ]; then
+            echo "❌ Aucun .app bundle trouvé. Listing du répertoire bin :"
+            find Platforms/AgValoniaGPS.iOS/bin -maxdepth 6 | head -50
+            exit 1
           fi
 
-  # Run all tests before building
-  test:
-    needs: check-changes
-    if: needs.check-changes.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+          echo "✅ .app trouvé : $APP"
+          mkdir Payload
+          cp -r "$APP" Payload/
+          zip -r AgValoniaGPS.ipa Payload/
+          rm -rf Payload
+          echo "📦 IPA prête — taille : $(du -sh AgValoniaGPS.ipa | cut -f1)"
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Run Model Tests
-        run: dotnet test Tests/AgValoniaGPS.Models.Tests/ --verbosity normal
-
-      - name: Run Service Tests
-        run: dotnet test Tests/AgValoniaGPS.Services.Tests/ --verbosity normal
-
-      - name: Run UI Tests
-        run: dotnet test Tests/AgValoniaGPS.UI.Tests/ --verbosity normal
-
-      - name: Run Guidance Algorithm Tests
-        run: dotnet run --project TestRunner/TestRunner.csproj
-
-  # Build Desktop versions (Windows, macOS, Linux)
-  build-desktop:
-    needs: [check-changes, test]
-    if: needs.check-changes.outputs.should_build == 'true' && github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            rid: win-x64
-            name: Windows-x64
-          - os: windows-latest
-            rid: win-arm64
-            name: Windows-ARM64
-          - os: macos-latest
-            rid: osx-arm64
-            name: macOS-ARM64
-          - os: macos-latest
-            rid: osx-x64
-            name: macOS-x64
-          - os: ubuntu-latest
-            rid: linux-x64
-            name: Linux-x64
-          - os: ubuntu-latest
-            rid: linux-arm64
-            name: Linux-ARM64
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Restore dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: dotnet restore Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj -p:DesktopOnly=true
-
-      - name: Restore dependencies (other)
-        if: runner.os != 'macOS'
-        run: dotnet restore Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj
-
-      # macOS uses DesktopOnly=true to skip iOS multi-targeting, enabling self-contained builds
-      - name: Build and Publish (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          dotnet publish Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj \
-            -c Release \
-            -r ${{ matrix.rid }} \
-            -f net10.0 \
-            -p:DesktopOnly=true \
-            --self-contained true \
-            -o publish/${{ matrix.name }}
-
-      - name: Build and Publish (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          dotnet publish Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj \
-            -c Release \
-            -r ${{ matrix.rid }} \
-            -f net10.0 \
-            --self-contained true \
-            -o publish/${{ matrix.name }}
-
-      - name: Build and Publish (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          dotnet publish Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj -c Release -r ${{ matrix.rid }} -f net10.0 --self-contained true -o publish/${{ matrix.name }}
-        shell: pwsh
-
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        run: Compress-Archive -Path publish/${{ matrix.name }}/* -DestinationPath AgValoniaGPS-${{ matrix.name }}.zip
-        shell: pwsh
-
-      - name: Create archive (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cd publish
-          zip -r ../AgValoniaGPS-${{ matrix.name }}.zip ${{ matrix.name }}
-
-      - name: Upload artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: AgValoniaGPS-${{ matrix.name }}
-          path: AgValoniaGPS-${{ matrix.name }}.zip
+          name: AgValoniaGPS-iOS
+          path: AgValoniaGPS.ipa
           retention-days: 30
+          if-no-files-found: error
 
-  # Build Android APK
+  # ───────────────────────────────────────────────────────────────────────────
+  # Android — APK signé (ou debug key si pas de secret configuré)
+  # ───────────────────────────────────────────────────────────────────────────
   build-android:
-    needs: [check-changes, test]
-    if: needs.check-changes.outputs.should_build == 'true' && github.event_name != 'pull_request'
+    name: 🤖 Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ inputs.build_android }}
 
     steps:
       - uses: actions/checkout@v4
@@ -206,7 +145,7 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore Platforms/AgValoniaGPS.Android/AgValoniaGPS.Android.csproj
 
-      - name: Decode signing keystore
+      - name: Decode keystore de signing
         id: keystore
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -215,21 +154,19 @@ jobs:
             echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/agvalonia-release.keystore"
             echo "path=$RUNNER_TEMP/agvalonia-release.keystore" >> "$GITHUB_OUTPUT"
             echo "present=true" >> "$GITHUB_OUTPUT"
-            echo "Using committed release keystore for a stable signing identity."
+            echo "✅ Keystore release chargé."
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::ANDROID_KEYSTORE_BASE64 secret not set — falling back to the runner's ephemeral debug key. The resulting APK will NOT update over installs signed by a different build."
+            echo "⚠️  Secret ANDROID_KEYSTORE_BASE64 absent — fallback sur la debug key éphémère."
+            echo "    L'APK résultant ne pourra pas mettre à jour une installation signée avec une autre clé."
           fi
 
-      - name: Build Android APK
+      - name: Build APK
         env:
-          # Read by AndroidSigning*Pass=env: below (keeps secrets off the command line)
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           ARGS=(publish Platforms/AgValoniaGPS.Android/AgValoniaGPS.Android.csproj
-                -c Release
-                -f net10.0-android
-                -o publish/android)
+                -c Release -f net10.0-android -o publish/android)
           if [ "${{ steps.keystore.outputs.present }}" = "true" ]; then
             ARGS+=(-p:AndroidKeyStore=true
                    "-p:AndroidSigningKeyStore=${{ steps.keystore.outputs.path }}"
@@ -239,213 +176,108 @@ jobs:
           fi
           dotnet "${ARGS[@]}"
 
-      - name: Find and rename APK
+      - name: Rename APK
         run: |
-          APK=$(find publish/android -type f -name "*-Signed.apk" | head -1)
-          if [ -n "$APK" ]; then
-            cp "$APK" AgValoniaGPS-Android-Signed.apk
-          else
-            echo "No signed APK found!"
-            exit 1
-          fi
+          APK=$(find publish/android -name "*-Signed.apk" | head -1)
+          [ -z "$APK" ] && APK=$(find publish/android -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then echo "❌ Aucun APK trouvé."; exit 1; fi
+          cp "$APK" AgValoniaGPS-Android.apk
+          echo "✅ APK : $(du -sh AgValoniaGPS-Android.apk | cut -f1)"
 
-      - name: Upload Android artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: AgValoniaGPS-Android
-          path: AgValoniaGPS-Android-Signed.apk
+          path: AgValoniaGPS-Android.apk
           retention-days: 30
+          if-no-files-found: error
 
-  # Build iOS (simulator .app bundle)
-  build-ios:
-    needs: [check-changes, test]
-    if: needs.check-changes.outputs.should_build == 'true' && github.event_name != 'pull_request'
-    runs-on: macos-26
+  # ───────────────────────────────────────────────────────────────────────────
+  # Desktop — Windows / macOS / Linux (self-contained, pas de .NET requis)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-desktop:
+    name: 🖥️ ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    if: ${{ inputs.build_desktop }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            name: Windows-x64
+          - os: windows-latest
+            rid: win-arm64
+            name: Windows-ARM64
+          - os: macos-latest
+            rid: osx-arm64
+            name: macOS-ARM64
+          - os: macos-latest
+            rid: osx-x64
+            name: macOS-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+            name: Linux-x64
+          - os: ubuntu-latest
+            rid: linux-arm64
+            name: Linux-ARM64
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Select Xcode 26.4.1
-        # The .NET for iOS workload is pinned to 26.4.x via
-        # .github/workflows/dotnet-ios-rollback.json so it matches the
-        # Xcode_26.4.1.app that's fully installed on macos-26. The runner
-        # also has Xcode_26.5_beta_2.app, but its iOS 26.5 platform isn't
-        # actually downloaded ("iOS 26.5 Platform Not Installed" from
-        # ibtool), so the 26.5 track is unusable. Roll forward when Apple
-        # ships Xcode 26.5 GA and the runner image installs it complete.
-        run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: Install iOS workload (pinned to 26.4.x)
+      # macOS multi-target : DesktopOnly=true pour éviter la résolution iOS
+      - name: Restore (macOS)
+        if: runner.os == 'macOS'
         run: |
-          for i in 1 2 3; do
-            dotnet workload install ios \
-              --from-rollback-file .github/workflows/dotnet-ios-rollback.json \
-              && break
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
+          dotnet restore Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj \
+            -p:DesktopOnly=true
 
-      - name: Restore dependencies
-        run: dotnet restore Platforms/AgValoniaGPS.iOS/AgValoniaGPS.iOS.csproj
+      - name: Restore (Windows / Linux)
+        if: runner.os != 'macOS'
+        run: dotnet restore Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj
 
-      - name: Build iOS
+      - name: Publish (macOS)
+        if: runner.os == 'macOS'
         run: |
-          dotnet build Platforms/AgValoniaGPS.iOS/AgValoniaGPS.iOS.csproj \
-            -c Debug \
-            -f net10.0-ios \
-            -r iossimulator-arm64
+          dotnet publish Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj \
+            -c Release -r ${{ matrix.rid }} -f net10.0 \
+            -p:DesktopOnly=true --self-contained true \
+            -o publish/${{ matrix.name }}
 
-      - name: Package iOS app
+      - name: Publish (Linux)
+        if: runner.os == 'Linux'
         run: |
-          APP=$(find Platforms/AgValoniaGPS.iOS/bin/Debug -name "*.app" -type d | head -1)
-          if [ -n "$APP" ]; then
-            cd "$(dirname "$APP")"
-            zip -r "$GITHUB_WORKSPACE/AgValoniaGPS-iOS-Simulator.zip" "$(basename "$APP")"
-          else
-            echo "No .app bundle found!"
-            exit 1
-          fi
+          dotnet publish Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj \
+            -c Release -r ${{ matrix.rid }} -f net10.0 \
+            --self-contained true -o publish/${{ matrix.name }}
 
-      - name: Upload iOS artifact
+      - name: Publish (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet publish Platforms/AgValoniaGPS.Desktop/AgValoniaGPS.Desktop.csproj `
+            -c Release -r ${{ matrix.rid }} -f net10.0 `
+            --self-contained true -o publish/${{ matrix.name }}
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path publish/${{ matrix.name }}/* -DestinationPath AgValoniaGPS-${{ matrix.name }}.zip
+
+      - name: Archive (Unix)
+        if: runner.os != 'Windows'
+        run: cd publish && zip -r ../AgValoniaGPS-${{ matrix.name }}.zip ${{ matrix.name }}
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: AgValoniaGPS-iOS-Simulator
-          path: AgValoniaGPS-iOS-Simulator.zip
+          name: AgValoniaGPS-${{ matrix.name }}
+          path: AgValoniaGPS-${{ matrix.name }}.zip
           retention-days: 30
-
-  # Create a release with all artifacts
-  create-release:
-    needs: [check-changes, test, build-desktop, build-android, build-ios]
-    if: always() && needs.check-changes.outputs.should_build == 'true' && needs.test.result == 'success' && (needs.build-desktop.result == 'success' || needs.build-android.result == 'success' || needs.build-ios.result == 'success')
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Get version and date
-        id: version
-        run: |
-          # Try to get version from version.h if it exists
-          if [ -f "sys/version.h" ]; then
-            VERSION=$(grep -oP 'VERSION\s+"\K[^"]+' sys/version.h || echo "0.0.0")
-          else
-            VERSION="0.0.0"
-          fi
-          DATE=$(date +'%Y%m%d')
-          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
-          RELEASE_TAG="${{ github.event.inputs.release_tag }}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "date=${DATE}" >> $GITHUB_OUTPUT
-          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
-          if [ -n "$RELEASE_TAG" ]; then
-            echo "tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
-            echo "is_release=true" >> $GITHUB_OUTPUT
-          else
-            echo "tag=nightly-${DATE}" >> $GITHUB_OUTPUT
-            echo "is_release=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: List artifacts
-        run: find artifacts -type f \( -name "*.zip" -o -name "*.apk" -o -name "*.ipa" \) | head -20
-
-      - name: Delete existing release (nightly only)
-        if: steps.version.outputs.is_release != 'true'
-        run: |
-          gh release delete ${{ steps.version.outputs.tag }} --yes || true
-          git push origin :refs/tags/${{ steps.version.outputs.tag }} || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create Tagged Release
-        if: steps.version.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: "AgValoniaGPS ${{ steps.version.outputs.tag }}"
-          body: |
-            ## Release ${{ steps.version.outputs.tag }}
-
-            **Version:** ${{ steps.version.outputs.version }}
-            **Commit:** ${{ steps.version.outputs.short_sha }}
-
-            ### Downloads
-
-            | Platform | File |
-            |----------|------|
-            | Windows x64 | `AgValoniaGPS-Windows-x64.zip` |
-            | Windows ARM64 | `AgValoniaGPS-Windows-ARM64.zip` |
-            | macOS ARM64 (M1/M2/M3) | `AgValoniaGPS-macOS-ARM64.zip` |
-            | macOS x64 (Intel) | `AgValoniaGPS-macOS-x64.zip` |
-            | Linux x64 | `AgValoniaGPS-Linux-x64.zip` |
-            | Linux ARM64 | `AgValoniaGPS-Linux-ARM64.zip` |
-            | Android | `AgValoniaGPS-Android-Signed.apk` |
-            | iOS Simulator (ARM64) | `AgValoniaGPS-iOS-Simulator.zip` |
-
-            ### Installation Notes
-            All desktop builds are self-contained - no .NET runtime install needed.
-            - **Windows**: Extract and run the .exe
-            - **macOS**: Extract, right-click the app and select "Open" (first time only)
-            - **Linux**: Extract, `chmod +x` the binary, then run
-            - **Android**: Enable "Install from unknown sources", then install the APK
-            - **iOS Simulator**: Extract .app, install with `xcrun simctl install booted AgValoniaGPS.iOS.app`
-          draft: false
-          prerelease: false
-          files: |
-            artifacts/**/*.zip
-            artifacts/**/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create Nightly Release
-        if: steps.version.outputs.is_release != 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: "Nightly Build - ${{ steps.version.outputs.date }}"
-          body: |
-            ## Automated Nightly Build
-
-            **Date:** ${{ steps.version.outputs.date }}
-            **Commit:** ${{ steps.version.outputs.short_sha }}
-            **Version:** ${{ steps.version.outputs.version }}
-
-            ### Downloads
-
-            | Platform | File |
-            |----------|------|
-            | Windows x64 | `AgValoniaGPS-Windows-x64.zip` |
-            | Windows ARM64 | `AgValoniaGPS-Windows-ARM64.zip` |
-            | macOS ARM64 (M1/M2/M3) | `AgValoniaGPS-macOS-ARM64.zip` |
-            | macOS x64 (Intel) | `AgValoniaGPS-macOS-x64.zip` |
-            | Linux x64 | `AgValoniaGPS-Linux-x64.zip` |
-            | Linux ARM64 | `AgValoniaGPS-Linux-ARM64.zip` |
-            | Android | `AgValoniaGPS-Android-Signed.apk` |
-            | iOS Simulator (ARM64) | `AgValoniaGPS-iOS-Simulator.zip` |
-
-            ### Installation Notes
-            All desktop builds are self-contained - no .NET runtime install needed.
-            - **Windows**: Extract and run the .exe
-            - **macOS**: Extract, right-click the app and select "Open" (first time only)
-            - **Linux**: Extract, `chmod +x` the binary, then run
-            - **Android**: Enable "Install from unknown sources", then install the APK
-            - **iOS Simulator**: Extract .app, install with `xcrun simctl install booted AgValoniaGPS.iOS.app`
-
-            ---
-            *Built automatically from the latest commit*
-          draft: false
-          prerelease: true
-          files: |
-            artifacts/**/*.zip
-            artifacts/**/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if-no-files-found: error
